@@ -1,0 +1,4 @@
+GitPython
+halo
+requests
+tqdm
