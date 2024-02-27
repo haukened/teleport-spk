@@ -1,6 +1,9 @@
 # Synology specific things
 pkgscripts-ng
 
+# vscode stuff
+.vscode
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
