@@ -16,6 +16,10 @@ from halo import Halo
 from tqdm import tqdm
 from typing import List
 
+if os.geteuid() != 0:
+    print("Please run this script with sudo, due to permissions required by the synology build system.")
+    exit(1)
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
     level=logging.INFO,
@@ -24,6 +28,7 @@ logging.basicConfig(
 
 # Github URLs
 BRANCHES_URL_FORMAT = "https://api.github.com/repos/{}/{}/branches"
+RELEASES_URL_FORMAT = "https://api.github.com/repos/{}/{}/releases"
 REPO_URL_FORMAT = "https://github.com/{}/{}.git"
 
 # SynologyOpenSource github repo
@@ -35,8 +40,9 @@ DSM_BRANCHES_API_URL = BRANCHES_URL_FORMAT.format(SYNO_GITHUB_USER, SYNO_GITHUB_
 # teleport github repo
 TELEPORT_GITHUB_USER = "gravitational"
 TELEPORT_GITHUB_REPO = "teleport"
-TELEPORT_REPO_URL = REPO_URL_FORMAT.format(TELEPORT_GITHUB_REPO, TELEPORT_GITHUB_REPO)
-TELEPORT_BRANCHES_URL = BRANCHES_URL_FORMAT.format(TELEPORT_GITHUB_REPO, TELEPORT_GITHUB_REPO)
+TELEPORT_REPO_URL = REPO_URL_FORMAT.format(TELEPORT_GITHUB_USER, TELEPORT_GITHUB_REPO)
+TELEPORT_BRANCHES_URL = BRANCHES_URL_FORMAT.format(TELEPORT_GITHUB_USER, TELEPORT_GITHUB_REPO)
+TELEPORT_RELEASES_URL = RELEASES_URL_FORMAT.format(TELEPORT_GITHUB_USER, TELEPORT_GITHUB_REPO)
 
 # DSM processor families
 SUPPORTED_PLATFORMS=[
@@ -72,16 +78,34 @@ with urllib.request.urlopen(DSM_BRANCHES_API_URL) as url:
     try:
         data = json.load(url)
     except:
-        print("Unable to load DSM versions from github")
+        logging.error("Unable to load DSM versions from github")
         exit(1)
     for item in data:
         version = str(item['name']).strip("DSM")
         if version != "master":
             SUPPORTED_VERSIONS.append(version)
+    # sort them alphabetically
+    SUPPORTED_VERSIONS = sorted(SUPPORTED_VERSIONS)
+
+# fetch the current teleport releases
+TELEPORT_RELEASES=[]
+with urllib.request.urlopen(TELEPORT_RELEASES_URL) as url:
+    try:
+        data = json.load(url)
+    except:
+        logging.error("Unable to load teleport releases from github")
+        exit(1)
+    for item in data:
+        version = str(item['tag_name'])
+        if (version != "master") and ("beta" not in version) and ("-rc." not in version):
+            TELEPORT_RELEASES.append(version)
+    # sort them alphabetically
+    TELEPORT_RELEASES = sorted(TELEPORT_RELEASES)
 
 # parse the command line arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--dsm-version", help="select the target version of DSM software", choices=SUPPORTED_VERSIONS, default=SUPPORTED_VERSIONS[-1])
+parser.add_argument("--teleport-version", help="select the target version of teleport", choices=TELEPORT_RELEASES)
 parser.add_argument("--processor", help="select the target processor family", choices=SUPPORTED_PLATFORMS, required=True)
 parser.add_argument("--cache-path", help="the path where downloads are cached", default="/var/cache/syno-build")
 parser.add_argument("--nocache", help="dont use cached files, always download", action="store_true")
@@ -128,11 +152,19 @@ def get_file(url: str, filename: str):
             # download the file to the cache
             download_file(url, cache_filepath)
         # copy the file to the destination
-        shutil.copyfile(cache_filepath, filename)            
-    
-if os.geteuid() != 0:
-    print("Please run this script with sudo, due to permissions required by the synology build system.")
-    exit(1)
+        shutil.copyfile(cache_filepath, filename)
+
+def checkout_git_repo(url: str, repo_path: str, branch_or_tag: str):
+    try:
+        with Halo(text="{} INFO     cloning repository".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")), spinner="bouncingBall", placement="right"):
+            repo = git.Repo.clone_from(url, repo_path)
+        logging.info("cloned {} to {}".format(url, repo_path))
+    except:
+        logging.error("unable to clone github repo {}".format(url))
+        exit(2)
+    # switch to the branch or tag
+    logging.info("checking out {}".format(branch_or_tag))
+    repo.git.checkout(branch_or_tag)
 
 # log the arguments
 logging.info("building teleport for DSM {} on {}".format(args.dsm_version, args.processor))
@@ -150,21 +182,18 @@ with tempfile.TemporaryDirectory(prefix="syno-build-") as build_directory:
     # create the required directories
     toolkit_path = os.path.join(build_directory, "scripts")
     os.makedirs(toolkit_path)
+    logging.info("created directory {}".format(toolkit_path))
     tarball_path = os.path.join(build_directory, "toolkit_tarballs")
     os.makedirs(tarball_path)
-    src_path = os.path.join(build_directory, "source")
+    logging.info("created directory {}".format(tarball_path))
+    src_path = os.path.join(build_directory, "source/teleport")
     os.makedirs(src_path)
+    logging.info("created directory {}".format(src_path))
 
     # clone the toolchain
-    try:
-        syno_repo = git.Repo.clone_from(PKGSCRIPTS_REPO_URL, toolkit_path)
-    except:
-        logging.error("unable to clone github repo {}".format(PKGSCRIPTS_REPO_URL))
-        exit(2)
-
-    # switch to the DSM branch
-    logging.info("cloning toolkit int build directory")
-    syno_repo.git.checkout("DSM{}".format(args.dsm_version))
+    checkout_git_repo(PKGSCRIPTS_REPO_URL, toolkit_path, "DSM{}".format(args.dsm_version))
+    # clone teleport
+    checkout_git_repo(TELEPORT_REPO_URL, src_path, args.teleport_version)
 
     # download the toolkit tarballs
     filesToDownload = get_syno_filelist(args.dsm_version, "base") + get_syno_filelist(args.dsm_version, args.processor)
@@ -175,7 +204,7 @@ with tempfile.TemporaryDirectory(prefix="syno-build-") as build_directory:
     
     # set up the environment by calling EnvDeploy
     # this will mount proc in the dev folder, preventing deletion, it will need to be unmounted after
-    logging.info("deploying build environment")
+    logging.info("deploying build environment to chroot")
     with Halo(text="{} JOKE     Playing some pong while tar files extract".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")), spinner="pong", placement="right"):
         with open("envdeploy.log", "wb") as logfile:
             deploy_script = os.path.join(toolkit_path, "EnvDeploy")
@@ -185,7 +214,7 @@ with tempfile.TemporaryDirectory(prefix="syno-build-") as build_directory:
     ##### all the build logic should go here #####
     ##############################################
     
-    # first we need to check out the teleport github repo
+    logging.info("Some kind of build logic here")
 
     ##############################################
     ############## End Build Logic ###############
